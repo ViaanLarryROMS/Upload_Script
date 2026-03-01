@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import datetime
+
+# ================= UTIL =================
+
+def error(msg):
+    print(f"ERROR: {msg}")
+    sys.exit(1)
+
+def read_metadata(path):
+    if not os.path.exists(path):
+        error("release_metadata.json not found.")
+    with open(path, "r") as f:
+        return json.load(f)
+
+def find_sha256(build_dir):
+    for f in os.listdir(build_dir):
+        if f.endswith(".sha256sum"):
+            with open(os.path.join(build_dir, f), "r") as s:
+                return s.read().strip()
+    return "Not Found"
+
+# ================= GENERATORS =================
+
+def generate_telegram(meta, sha):
+    msg = f"""
+📢 *{meta['rom']} - {meta['server']} Build*
+
+👤 Maintainer: {meta['user']}
+📅 Build Date: {meta['date'][:10]}
+
+⬇️ *Downloads:*
+"""
+
+    if meta.get("drive_link"):
+        msg += f"\n🌐 Google Drive:\n{meta['drive_link']}\n"
+
+    if meta.get("gofile_links"):
+        msg += "\n📦 GoFile:\n"
+        for name, link in meta["gofile_links"].items():
+            msg += f"{name}\n{link}\n"
+
+    msg += f"\n🔐 SHA256:\n`{sha}`\n"
+
+    return msg.strip()
+
+
+def generate_xda(meta, sha):
+    msg = f"""
+[SIZE=5][B]{meta['rom']} - {meta['server']} Build[/B][/SIZE]
+
+Maintainer: {meta['user']}
+Build Date: {meta['date'][:10]}
+
+Downloads:
+"""
+
+    if meta.get("drive_link"):
+        msg += f"\nGoogle Drive:\n{meta['drive_link']}\n"
+
+    if meta.get("gofile_links"):
+        msg += "\nGoFile:\n"
+        for name, link in meta["gofile_links"].items():
+            msg += f"{name}\n{link}\n"
+
+    msg += f"\nSHA256:\n{sha}\n"
+
+    return msg.strip()
+
+
+def generate_markdown(meta, sha):
+    msg = f"""
+# {meta['rom']} - {meta['server']} Build
+
+**Maintainer:** {meta['user']}  
+**Build Date:** {meta['date'][:10]}
+
+## Downloads
+"""
+
+    if meta.get("drive_link"):
+        msg += f"\n- **Google Drive:** {meta['drive_link']}\n"
+
+    if meta.get("gofile_links"):
+        for name, link in meta["gofile_links"].items():
+            msg += f"- **GoFile ({name}):** {link}\n"
+
+    msg += f"\n## SHA256\n`{sha}`\n"
+
+    return msg.strip()
+
+# ================= MAIN =================
+
+def main():
+
+    if len(sys.argv) != 2:
+        print("Usage:")
+        print("  romrelease <build_directory>")
+        sys.exit(1)
+
+    build_dir = sys.argv[1]
+
+    metadata_path = os.path.join(build_dir, "release_metadata.json")
+    meta = read_metadata(metadata_path)
+
+    sha = find_sha256(build_dir)
+
+    telegram = generate_telegram(meta, sha)
+    xda = generate_xda(meta, sha)
+    markdown = generate_markdown(meta, sha)
+
+    print("\n" + "="*60)
+    print("TELEGRAM MESSAGE")
+    print("="*60)
+    print(telegram)
+
+    print("\n" + "="*60)
+    print("XDA POST")
+    print("="*60)
+    print(xda)
+
+    print("\n" + "="*60)
+    print("MARKDOWN RELEASE")
+    print("="*60)
+    print(markdown)
+
+    # Optional save
+    with open(os.path.join(build_dir, "release.txt"), "w") as f:
+        f.write(markdown)
+
+    print("\nSaved Markdown release to release.txt")
+
+if __name__ == "__main__":
+    main()
