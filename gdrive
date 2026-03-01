@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import hashlib
+import datetime
+import json
+import time
+import re
+
+# ================= CONFIG =================
+
+RCLONE_CONFIG = os.path.expanduser("~/.config/rclone/rclone.conf")
+REMOTE_NAME = "gd"
+SERVER_NAME = "Placebo"
+BASE_PATH = f"ROM_BUILDS/{SERVER_NAME}/users"
+LOCK_DIR = "/tmp/placebo_upload_locks"
+
+# PERFORMANCE (Dual ISP Optimized)
+TRANSFERS = 10
+CHECKERS = 10
+MULTI_THREAD_STREAMS = 4
+BUFFER_SIZE = "64M"
+DRIVE_CHUNK_SIZE = "64M"
+LOW_LEVEL_RETRIES = 10
+RETRIES = 5
+
+# ================= UTILITIES =================
+
+def banner():
+    print("\n" + "=" * 70)
+    print("        GDRIVE Uploader made by Viaan")
+    print("        Placebo Dual-ISP Release Infrastructure")
+    print("=" * 70 + "\n")
+
+def error(msg):
+    print(f"\nERROR: {msg}")
+    sys.exit(1)
+
+def run_cmd(cmd):
+    return subprocess.run(cmd)
+
+def run_cmd_output(cmd):
+    return subprocess.check_output(cmd).decode().strip()
+
+def sha256(file_path):
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def human_size(size):
+    for unit in ['B','KB','MB','GB','TB']:
+        if size < 1024:
+            return f"{size:.2f} {unit}"
+        size /= 1024
+    return f"{size:.2f} PB"
+
+def check_remote():
+    try:
+        output = run_cmd_output(["rclone", "--config", RCLONE_CONFIG, "listremotes"])
+        if f"{REMOTE_NAME}:" not in output:
+            error("Drive remote 'gd' not found in rclone config.")
+    except:
+        error("rclone not installed or not configured.")
+
+# ================= LOCK SYSTEM =================
+
+def create_lock(user, rom):
+    os.makedirs(LOCK_DIR, exist_ok=True)
+    lock_path = f"{LOCK_DIR}/{user}_{rom}.lock"
+    if os.path.exists(lock_path):
+        error("Another upload for this ROM folder is running.")
+    open(lock_path, "w").close()
+    return lock_path
+
+def remove_lock(lock):
+    if os.path.exists(lock):
+        os.remove(lock)
+
+# ================= DRIVE UPLOAD =================
+
+def drive_upload(local, remote):
+
+    cmd = [
+        "rclone",
+        "--config", RCLONE_CONFIG,
+        "copy",
+        local,
+        remote,
+        "--progress",
+        "--transfers", str(TRANSFERS),
+        "--checkers", str(CHECKERS),
+        "--multi-thread-streams", str(MULTI_THREAD_STREAMS),
+        "--buffer-size", BUFFER_SIZE,
+        "--drive-chunk-size", DRIVE_CHUNK_SIZE,
+        "--low-level-retries", str(LOW_LEVEL_RETRIES),
+        "--retries", str(RETRIES),
+        "--fast-list"
+    ]
+
+    result = run_cmd(cmd)
+    if result.returncode != 0:
+        error(f"Drive upload failed for {local}")
+
+def generate_drive_link(remote_path):
+    try:
+        return run_cmd_output([
+            "rclone",
+            "--config", RCLONE_CONFIG,
+            "link",
+            remote_path
+        ])
+    except:
+        return "Drive link generation failed."
+
+# ================= GOFILE UPLOAD (BAKED-IN) =================
+
+def upload_to_gofile(file_path):
+
+    # Get best GoFile server
+    try:
+        server = run_cmd_output([
+            "curl", "-ks", "https://api.gofile.io/servers"
+        ])
+        server_name = subprocess.check_output(
+            ["jq", "-r", ".data.servers[0].name"],
+            input=server.encode()
+        ).decode().strip()
+    except:
+        return "GoFile server fetch failed."
+
+    if not server_name or server_name == "null":
+        return "GoFile server unavailable."
+
+    # Upload file
+    try:
+        upload_result = subprocess.check_output([
+            "curl", "-s",
+            "-F", f"file=@{file_path}",
+            f"https://{server_name}.gofile.io/uploadFile"
+        ])
+
+        link = subprocess.check_output(
+            ["jq", "-r", ".data.downloadPage"],
+            input=upload_result
+        ).decode().strip()
+
+        if not link or link == "null":
+            return "GoFile upload failed."
+
+        return link
+
+    except:
+        return "GoFile upload failed."
+
+# ================= MAIN =================
+
+def upload_mode(build_dir):
+
+    user = os.getenv("USER")
+
+    rom_folder = input("Enter ROM folder name: ").strip()
+    if not rom_folder:
+        error("ROM folder name empty.")
+
+    if not re.match(r'^[A-Za-z0-9._-]+$', rom_folder):
+        error("Invalid ROM folder name.")
+
+    print("\nUpload mode:")
+    print("1) Google Drive only")
+    print("2) GoFile only")
+    print("3) Both (Drive + GoFile)")
+    mode = input("Select (1/2/3): ").strip()
+
+    if mode not in ["1", "2", "3"]:
+        error("Invalid selection.")
+
+    check_remote()
+    lock = create_lock(user, rom_folder)
+
+    try:
+
+        main_dest = f"{REMOTE_NAME}:{BASE_PATH}/{user}/{rom_folder}"
+        recovery_dest = f"{main_dest}/recovery"
+
+        os.chdir(build_dir)
+
+        zip_files = []
+        img_files = []
+
+        for f in os.listdir():
+            if f.endswith(".zip") and "ota" not in f.lower():
+                zip_files.append(f)
+
+        for img in ["boot.img", "recovery.img", "dtbo.img", "vendor_boot.img"]:
+            if os.path.exists(img):
+                img_files.append(img)
+
+        if not zip_files and not img_files:
+            error("No valid artifacts found.")
+
+        total_size = sum(os.path.getsize(f) for f in zip_files + img_files)
+
+        print("\nDetected files:")
+        for f in zip_files + img_files:
+            print(f" - {f} ({human_size(os.path.getsize(f))})")
+
+        confirm = input("\nProceed? (y/n): ").lower()
+        if confirm != "y":
+            return
+
+        drive_link = None
+        gofile_links = {}
+
+        # SHA256
+        for z in zip_files:
+            with open(z + ".sha256sum", "w") as s:
+                s.write(sha256(z))
+
+        # DRIVE
+        if mode in ["1", "3"]:
+            for z in zip_files:
+                drive_upload(z, main_dest)
+                drive_upload(z + ".sha256sum", main_dest)
+
+            for img in img_files:
+                drive_upload(img, recovery_dest)
+
+            drive_link = generate_drive_link(main_dest)
+
+        # GOFILE
+        if mode in ["2", "3"]:
+            for z in zip_files:
+                link = upload_to_gofile(z)
+                gofile_links[z] = link
+
+        # METADATA
+        if mode in ["1", "3"]:
+            metadata = {
+                "rom": rom_folder,
+                "user": user,
+                "server": SERVER_NAME,
+                "date": datetime.datetime.now().isoformat(),
+                "drive_link": drive_link,
+                "gofile_links": gofile_links,
+                "files": zip_files + img_files
+            }
+
+            with open("release_metadata.json", "w") as meta:
+                json.dump(metadata, meta, indent=4)
+
+            drive_upload("release_metadata.json", main_dest)
+
+        # FINAL SUMMARY
+        print("\n" + "=" * 65)
+        print("                    RELEASE LINKS")
+        print("=" * 65)
+
+        if drive_link:
+            print("\nGoogle Drive:")
+            print(drive_link)
+
+        if gofile_links:
+            print("\nGoFile:")
+            for name, link in gofile_links.items():
+                print(f"\n{name}")
+                print(link)
+
+        print("\n" + "=" * 65)
+        print("Upload completed successfully on Placebo.")
+        print("=" * 65)
+
+    finally:
+        remove_lock(lock)
+
+# ================= ENTRY =================
+
+def main():
+    banner()
+
+    if len(sys.argv) < 2:
+        print("Usage:")
+        print("  gdrive push <build_directory>")
+        print("  gdrive url <ROM_FOLDER>")
+        sys.exit(1)
+
+    if sys.argv[1] == "push":
+        if len(sys.argv) != 3:
+            error("Missing build directory.")
+        upload_mode(sys.argv[2])
+
+    elif sys.argv[1] == "url":
+        user = os.getenv("USER")
+        rom = sys.argv[2]
+        remote_path = f"{REMOTE_NAME}:{BASE_PATH}/{user}/{rom}"
+        print(generate_drive_link(remote_path))
+
+    else:
+        error("Invalid command.")
+
+if __name__ == "__main__":
+    main()
